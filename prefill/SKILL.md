@@ -17,6 +17,10 @@ CI job log ──①解析──> prefill_forwards.csv ──①a切warmup──
                                     final_points_unique.csv
                                               │
                                               └──③a diff 上轮已测──> points_todo.csv ──④aiperf──> 实测 TTFT/吞吐
+                                                                                            │
+                                                                            ⑤ 给 4305 个 forward 逐个定价
+                                                                                            │
+                                                                              三个吞吐值(实际→忙时→硬件)
 ```
 
 **②③④ 一律用切完 warmup 的 profiling 段**，只有 ①b 的 trace 保留全量。
@@ -42,7 +46,7 @@ python3 scripts/parse_prefill_log.py /tmp/job<JOB_ID>.log -o <outdir> --label "<
 | `forward_idx,time` | forward 序号 / 调度时刻（秒级） |
 | `req_id,done_tokens,chunk_tokens,ISL,progress_pct` | 该请求本步的 chunk：`done_tokens` 是已在 KV cache 的上下文，`chunk_tokens` 是本步新算的 token |
 | `batch_reqs,batch_tokens` | 整个 forward 的规模（每行重复） |
-| `eq_batch_size,eq_query_length,eq_context_length` | **等价同构 batch**（每行重复），见下 |
+| `eq_batch_size,eq_query_length,eq_context_length` | **等价同构 batch**（每行重复），见下, 具体内容参考`ragged_packed_prefill_workload_equivalence.md` |
 | `attn_work_pairs,imbalance_rq,imbalance_rL` | Attention 总工作量与长度不均衡度，判断等价映射可信度 |
 | `final_context_length,final_query_length` | ③ 写回的角点坐标（每行重复） |
 
@@ -415,7 +419,7 @@ b≥2 外推确实不比内插差（那片区域本来就拟合得差）；但 *
   日志行可能在最后一个 blocker step 还在执行时就打出来了。本例实测 **+96.2 ms**（对照：同 harness
   但每组只发一条请求）。**每个 b 值都要单独跑一次对照量这个偏置**，否则跨 b 比较得到的是 harness 差异。
   好消息是**斜率对常数偏置免疫**，只比"对 context 的敏感度"时不受影响。
-- ~~b≥3 目前没有验证过的 harness~~ **已验证。** `run_stage_bn.sh` 的 fixed-schedule + 32 blocker
+- **已验证。** `run_stage_bn.sh` 的 fixed-schedule + 32 blocker
   方案对 b=2..9 全部成立，上一轮 `stage_bn_timing.csv` **44/44 全 OK**
   （b=3×6, b=4×7, b=5×2, b=6×2, b=7×1, b=8×1, b=9×1）。
   关键是 blocker 数取 8 的倍数：ISL=1024 的冷请求 8 个正好零余量填满 8192，排干后队列里
@@ -423,6 +427,125 @@ b≥2 外推确实不比内插差（那片区域本来就拟合得差）；但 *
   唯一的硬约束是 `b*q ≤ 8192`（预算不变时物理上凑不出更大的 batch）。
 - 单点耗时几乎与 c、q 无关（被 fixed-schedule 的时间表撑着）：**b=1 约 51 s/点，b=2 约 152 s/点**。
   673 个点全跑约 25 h（不含重跑），覆盖 80% 时间的 214 个点约 5 h，覆盖 50% 的 75 个点约 1.2 h。
+
+---
+
+## ⑤ 三个吞吐值 —— 实测点表的最终用途
+
+④ 测出来的点表本身不是目的。目的是**给 profiling 段的 forward 逐个定价**,
+把"这批 batch 形状如果背靠背跑完要多久"算出来, 得到一条三级阶梯。
+
+全部限定 profiling 段 (①a 切完 warmup)。基础量: 4,305 forward / 2,472 请求 /
+ISL 320.76 M / fresh 13.89 M (命中率 95.67%, 两个口径差 **23.09x**)。
+
+| # | 量 | ISL 口径 | fresh 口径 | 分母 | 估算成分 | 备注 |
+|---|---|---:|---:|---|---|---|
+| **1** | 实际交付吞吐 | **81,619** | 3,535 | aiperf 窗口 3,930 s | **零** —— 分子分母全直读 | |
+| **2** | 忙时吞吐 (剔空转) | **>= 149,680** | >= 6,482 | GPU 忙 <= 2,143 s | 分母是估算的**上界** ⟹ 结果是**下界**| 第`k`个forward的时间为`t[k+1] - t[k]`, `t[k]`是第`k`个prefill batch调度完成、马上要launch forward的时刻 |
+| **3** | 理想上限 | **204,801** | 10,066 | Σ 实测纯 forward = 1,034.8 s | 单价全是引擎内埋点实测, 但**只覆盖 66.1% 的 ISL** | 估计值, $\Sigma_{i} (t_i / T) tput_i$: 其中$t_i$和$tput_i$都是通过测量纯模型forward的时间得到的 |
+
+```
+81,619  ──剔除无请求可调度的空转──>  >=149,680  ──剔除 step 内一切非模型开销──>  204,801
+ 1.00x                                >=1.83x                                  2.51x
+```
+
+⚠️ **#3 是子集口径。** 3,400/4,305 个 forward 能在点表里查到单价, 它们占 fresh 的 75.0%、
+ISL 的 66.1%。**剩下 905 个 forward 没有全段外推**(下面 ⑤a 末尾说明为什么)。
+
+### #1 实际交付吞吐 — 直读
+
+见 ①a "CI 报的吞吐是什么口径"。要点: 分母是 **3,930 s**(三个全局吞吐交叉验证得到),
+**不是** `Benchmark Duration: 3621.10 sec`(那是信用窗口)。分子用完整 ISL 得 81,619,
+换成 `Σ chunk_tokens` 得 3,535。
+
+### #2 忙时吞吐 — trace 窗口减空转
+
+分母 = trace 窗口 3,602 s − 空转 >= 1,457 s。空转来自 ①b 的 `idle_gaps.json`,
+只把"running 与 waiting 队列**均为空**"记作 idle, 且时长保守折算 —— 两个偏向同向,
+所以空转是下界、忙时间是上界、吞吐是下界。**是不等式, 但方向确定。**
+
+
+### #3 固定模型优化下的天花板 — 查点表 + 引擎内埋点
+
+```bash
+python3 scripts/throughput_from_probe.py     # 看 "口径 B" 那一段
+```
+
+把每个 forward 按 `(final_context_length, final_query_length, eq_batch_size)` 去查
+⑤a 产出的探针表, 取 `fwd_gpu_ms` 当单价:
+
+```
+4,305 个 forward → 命中 3,400 (79.0%), Σ 实测纯 forward = 1,034.8 s
+覆盖 fresh 75.0% / ISL 66.1%
+→ ISL 204,801 / fresh 10,066 tok/s
+```
+
+### ⑤a 装 forward 探针 (#3 的数据来源)
+
+`fwd_gpu_ms` 拿不到就没有 #3。它必须从引擎内部量, 外部黑盒测不出来。
+
+**埋点**: `scripts/_fwdprobe.py`(可复用副本, 无第三方依赖, 复制即用;
+生产副本在被插桩的引擎包里 `atom/_fwdprobe.py`)。三个挂点, 不设环境变量时全是 no-op、零开销:
+
+| 装饰器 | 挂在 | 产出 |
+|---|---|---|
+| `@probe_gpu` | `ModelRunner.run_model` | `fwd_gpu_ms` — HIP event, **延迟读取** |
+| `@probe_wall` | `ModelRunner.forward` (prefill) | `step_wall_ms` / `step_period_ms` — perf_counter |
+| `@probe_wall` | `<Decode>ModelRunner.forward` | 同上 (decode 侧, 本流水线不用) |
+
+```bash
+docker run ... -e ATOM_FWDPROBE=/path/fwdprobe.jsonl -e ATOM_FWDPROBE_LAG=8 ...
+```
+
+⚠️ **`probe_wall` 必须挂在 `@torch.inference_mode()` 之上(最外层)**, 否则量不到完整 forward:
+
+```python
+@_fwdprobe.probe_wall
+@torch.inference_mode()
+@with_eplb_forward_monitor
+def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+```
+
+**换引擎只需改 `_batch_meta()`** —— 它按 ATOM 的 `ScheduledBatch` 取字段
+(`num_scheduled_tokens` / `context_lens` / `total_tokens_num_prefill` ...)。
+取不到时写 `meta_err` 而不抛异常, **探针永远不会弄崩一个 forward**。
+⚠️ ctx 的约定是 `ctx = context_lens - num_scheduled_tokens`, 与 bench harness 的 (c,q) 一致 ——
+**c 是已在 KV cache 里的上下文, 不是 ISL**(同 ① 里 `done_tokens` vs `ISL` 那个区分)。
+
+**为什么 GPU 时间必须用 event 而不是 perf_counter**: kernel launch 是异步的,
+`perf_counter` 包住 `self.model(...)` 量到的是**launch 时间不是 GPU 时间**。
+`torch.cuda.Event` 映射到 hipEvent, 在 stream 上打时间戳。
+**关键是 `elapsed_time()` 的读取延迟 `DRAIN_LAG=8` 次 forward** —— 立即读会隐式
+同步、把流水线串行化, 那恰好就是我们不想扰动的东西。
+
+**跑法**: 用与 ④ 完全相同的 harness 重跑一遍点表(`run_points_instr.sh` 跑 b=1,
+`run_bn_instr.sh` 跑 b>=2), 探针在引擎内侧被动记录, 不影响 aiperf 侧的测量。
+每点约 116 s(b>=2), 210 个点约 3.5 h。**context length 这个变量是 harness 造的,
+不是探针造的** —— primer 请求先把 c 个 token 的前缀种进 KV cache, 测量请求靠显式
+`hash_ids` 复用它(③ 的 `gen_b2_trace.py`), 探针只是把命中之后的 `ctx` 如实记下来。
+本例探针侧 ctx 有 151 个不同取值 / 0..753,664, 前缀命中率 95.7%, 与 trace 侧一致。
+
+**合流**:
+
+```bash
+python3 join_probe.py    # fwdprobe.jsonl + 参考点表 -> RESULTS_probe_vs_bench.csv
+```
+
+按 `(ctx, q, b)` 分桶, 只保留 `dummy=0 / decode=0 / ctx 与 q 组内齐一`的纯 prefill forward,
+取每桶中位数。**q<1024 的桶用 ±16 容差匹配** —— 那一档没有 ISL anchor 兜底,
+aiperf 合成长度有几个 token 抖动(同 ③ 的 `--no-snap-below` 那个坑), 不给容差会全部 join 不上。
+本例落地 210 个点 / 252 行。12,967 次 forward 里 9,510 次是 GPU-bound(host 先返回、
+GPU 还在算), 符合预期。
+
+
+### 两个注意事项
+
+1. **权重取时间占比时, 加权平均在代数上恒等于聚合吞吐**: `Σ(t_i/T)(tok_i/t_i) = Σtok_i/T`。
+   所以算出来的**就是** total/total, 不是"平均每个 forward 的吞吐"。后者要按**次数**加权,
+   会被大量廉价小 batch 拉高, 是另一个量。曾经记的 9,541 tok/s 是次数加权那一种, **已作废**。
+2. **ISL 不能按 `prefill_forwards_profiling.csv` 的行直接累加。** 那是 (forward, request) 对,
+   被 chunk 切开的请求会在它跨的每个 forward 里各记一遍完整 ISL, 全段加出 484 M 而真实只有
+   320.76 M(虚高 1.5x)。正确做法: 每个请求的 ISL 只归到它**最后一个** forward。
 
 ---
 
@@ -440,6 +563,8 @@ b≥2 外推确实不比内插差（那片区域本来就拟合得差）；但 *
 ③ 格子数 ≥ 角点数，待测点数 ≥ 角点数
 ③ --rank-by time 时不该出现"找不到执行时间"的告警（trace 和 CSV 应同批生成）
 ③ final_points_unique.csv 里不该有 final_query_length == 0 的行（测不了的坐标）
+⑤ 探针路线的匹配 forward 数与覆盖率要一起报（本例 3400/4305 = 79.0%，ISL 覆盖 66.1%）
+⑤ throughput_from_*.py 里 assert 加权和 == Σtok/T 必须通过（口径自检）
 ```
 
 等价点可以手算抽查：任取一个 `batch_reqs≥5` 的 forward，按公式算 `q_eq/c_eq` 和 CSV 对齐
