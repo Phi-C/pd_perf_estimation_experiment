@@ -1,98 +1,51 @@
-# Agent 任务下 Decode 节点的理想吞吐估计
+# Decode：按请求形状分布估计性能
 
-目标：用 trace / 数据集里真实出现过的 request 形状，估计 Decode 节点在**只跑这些形状、且每个形状都测到稳定吞吐**时的理想吞吐。做法与 prefill 侧相同：把形状映射到二维网格上，只测覆盖足够多 request 的格子，再按格子里的 request 数加权。
+这条路线以请求为样本，固定并发测量代表形状的 decode serving 性能。它不需要完整的 running batch trace；有逐步 batch 信息时，可使用[Decode 工作量等价法](ragged_packed_decode_workload_equivalence.md)。
 
-下文一条 request 对应平面上一个点 $(I, L_{\mathrm{ctx}})$：
+## 1. 用平均上下文描述请求
 
-- $I$：`ISL`（input sequence length，decode 开始时 KV 里已有的 prompt token 数）
-- $L_{\mathrm{ctx}} = I + O/2$（decode 过程中上下文长度的中点；$O$ 是该请求的 `OSL`）
-
-报的吞吐是 **output tok/s**。
-
-## 1. 分箱
-
-对全部 $N$ 条 request 的 $(I, L_{\mathrm{ctx}})$ 做等距网格：
-
-- $I$ 方向每 $8192$ 一格
-- $L_{\mathrm{ctx}}$ 方向每 $1024$ 一格
-
-格子 $(i, j)$ 覆盖
+一条请求对应 $(I,L_{\mathrm{ctx}})$：
 
 $$
-I \in [8192\,i,\ 8192\,(i+1)),
-\qquad
-L_{\mathrm{ctx}} \in [1024\,j,\ 1024\,(j+1))
+I=ISL,\qquad L_{\mathrm{ctx}}\approx ISL+OSL/2
 $$
 
-任意 request 恰好落入一格。记 $N_{ij}$ 为落入 $(i, j)$ 的点数，则 $\sum_{i,j} N_{ij} = N$。
+`L_ctx` 是整条生成路径的代表位置，不是首个 Decode step 的实际 KV 长度。输出长度较长或性能沿上下文变化明显时，应分段测量。
 
-## 2. 代表点
+## 2. 分箱并选择代表点
 
-空格子丢掉。非空格子用格内点的**取整均值**当测量坐标 $(I_i, L_{\mathrm{ctx},j})$，避免用格子边角去测一个实际很少出现的形状：
-
-$$
-I_i = \mathrm{round}\left(\frac{1}{N_{ij}}\sum_{n=1}^{N_{ij}} I_n\right),
-\qquad
-L_{\mathrm{ctx},j} = \mathrm{round}\left(\frac{1}{N_{ij}}\sum_{n=1}^{N_{ij}} L_{\mathrm{ctx},n}\right)
-$$
-
-$I_n$、$L_{\mathrm{ctx},n}$ 是该格内第 $n$ 个点的 `ISL`、`L_ctx`。$L_{\mathrm{ctx},j}$ 不要吸到 0（没有上下文就没有 decode）。
-
-## 3. 按覆盖率选格并赋权
-
-按 $N_{ij}$ **从高到低**选格子，累加点数，直到首次满足
+示例网格为 `ΔI = 8192`、`ΔL_ctx = 1024`。统计每格请求数 $N_{ij}$，以格内坐标的取整均值作代表点。按请求数降序选格，累计覆盖率达到 $\alpha$ 后停止；入选集合内的权重为：
 
 $$
-\sum_{(i,j)\in S} N_{ij} \ge \alpha N
+w_{ij}=\frac{N_{ij}}{N_S},\qquad N_S=\sum_{(i,j)\in S}N_{ij}
 $$
 
-$S$ 是入选集合，$\alpha$ 是覆盖率阈值（例如 $0.8$）。排在后面的稀有形状不测。
-
-权重只在入选格子上归一化（入选格子的权重和为 $1$）：
+保留原始 OSL 分布并检查代表点的输出长度：
 
 $$
-N_S = \sum_{(i,j)\in S} N_{ij},
-\qquad
-w_{ij} = \frac{N_{ij}}{N_S}
-\quad (i,j)\in S
+O_j=2(L_{\mathrm{ctx},j}-I_i)>0
 $$
 
-## 4. 定点实测，再加权
+短输出请求可能因取整得到非法长度，应重新选代表值。`OSL = 1` 的请求没有可用于 ITL 的后续生成区间，应单独统计。
 
-先**指定一个并发** $C$（`--concurrency` $C$）。所有入选格子都在这个 $C$ 下测，得到的 $\hat{T}$ 才是「该并发下的理想吞吐」；不要把不同 $C$ 的 $T_{ij}$ 混进同一次加权。
+## 3. 在同一并发下测量
 
-对每个 $(i,j)\in S$，固定形状 $(I_i, L_{\mathrm{ctx},j})$，在并发 $C$ 下测得吞吐 $T_{ij}$（output tok/s）。理想吞吐取入选格子的加权平均：
+每点固定 `(ISL = I_i, OSL = O_j, concurrency = C)`，按[独立 cache-replay 方法](standalone_aiperf_decode_cache_replay.md)准备缓存并重放；只使用测量轮的指标。
 
-$$
-\hat{T}(C) = \sum_{(i,j)\in S} w_{ij}\, T_{ij}(C)
-$$
+| 输出 | 使用条件 |
+|---|---|
+| AIPerf `output_token_throughput` | 客户端完整窗口口径，包含首 token 边界和 ramp / drain |
+| $C/ITL$ | 仅在实际 running batch 稳定为 C、ITL 能代表单步时间时近似成立，ITL 单位为秒 |
+| $b/D$ | 引擎侧稳定 batch 吞吐，需要逐步验证 b 并测量 step period |
 
-$w_{ij}$ 是该形状在入选集合里出现的频繁程度，$T_{ij}(C)$ 是这个形状在并发 $C$ 下的 decode 吞吐。
+所有点使用相同的计量方式。记录实际 ISL / OSL、两遍 prompt 一致性、组内请求差异、缓存命中率和成功请求数。AIPerf 的并发参数本身不能证明实际 batch 大小。
 
-由 $L_{\mathrm{ctx}} = I + O/2$ 反推该点要生成的长度 $O_j = 2(L_{\mathrm{ctx},j} - I_i)$。必须 $L_{\mathrm{ctx},j} > I_i$，否则 $O_j$ 无意义（至少为 1）。
-
-测 $T_{ij}(C)$ 按 `standalone_aiperf_decode_cache_replay.md`（两遍 cache-replay），参数对应那份文档里的 `(ISL, OSL, B)`：
-
-```text
---isl          = I_i
---osl          = O_j
---concurrency  = C      （即那份文档里的 B）
-```
-
-细节（payload 校验、Prefix Cache 命中、服务端怎么起）仍看那份文档，下面只钉和 $\hat{T}(C)$ 有关的口径。
-
-**$T_{ij}(C)$ 用哪个数。** 优先用 Pass 2 的 ITL（不含 TTFT）：
+## 4. 汇总及范围
 
 $$
-T_{ij}(C) \approx \frac{C}{\mathrm{ITL}_{ij}(C)}
+\overline T_{\mathrm{shape}}(C)=\sum_{(i,j)\in S}w_{ij}T_{ij}(C)
 $$
 
-也可以用 Pass 2 的 `output_throughput_total_tps`（含首 token 边界，略偏 e2e）。不要用 Input tok/s，也不要把 Pass 1（建 cache 的冷 prefill）算进去。
+这是固定并发下的形状加权性能。若估计完成这批请求的吞吐，使用[工作量 / 时间汇总](../docs/metrics.md#4-按请求形状加权时的区别)，其每请求工作量为与指标一致的 `OSL` 或 `OSL − 1`。
 
-**什么样的点才准入加权。** 未过门槛的点不进入 $\hat{T}(C)$：
-
-- 两遍 payload 一致，成功请求数 $= C$
-- Pass 2 Prefix Cache hit 过阈值
-- `inputs.json` 里 $C$ 条 prompt **不能有两条完全相同**（整段复制会让两条请求共用同一份 KV，decode 读同一批页，ITL 会偏低）。允许偶尔共享一小段公共前缀——这是 agent 任务的常态（系统提示、工具说明、同一段对话历史）。脚本只校验两遍 payload 一致，不检查组内是否出现完全重复，采数前要打开 `inputs.json` 看一眼。
-
-**测到的是什么。** 这是本机 Prefix Cache 命中后的 Decode-dominant serving 吞吐，不是零 prefill 的纯 kernel，也不是真实 1P1D decode 节点（那份方法禁止 P/D 和 KV-transfer）。客户端 `--concurrency C` 不能保证每步 running batch 都是 $C$，ramp/drain 时 $B_t < C$。
+Cache-replay 反映本地缓存命中后的 serving 路径。实际 P/D 部署还包含 KV 传输、路由和负载变化，需要端到端验证。当前仓库的 [gen_decode_points.py](../scripts/gen_decode_points.py) 按 membership 区间选 forward 测点，和本文的请求级二维分箱是两条不同流程。

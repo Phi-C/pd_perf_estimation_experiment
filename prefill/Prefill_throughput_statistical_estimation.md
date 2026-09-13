@@ -1,66 +1,55 @@
-# Agent 任务下 Prefill 节点的理想吞吐估计
+# Prefill：按请求形状分布估计性能
 
-目标：用 trace / 数据集里真实出现过的 request 形状，估计 Prefill 节点在**只跑这些形状、且每个形状都测到稳定吞吐**时的理想吞吐。做法是把形状映射到二维网格上，只测覆盖足够多 request 的格子，再按格子里的 request 数加权。
+这条路线用少量代表点描述给定并发下的 serving 性能。它适用于缺少完整 batch trace、但知道缓存前缀与新增输入分布的情况。先阅读[统计口径](../docs/metrics.md)，需要按实际 forward 定价时使用[工作量等价法](ragged_packed_prefill_workload_equivalence.md)。
 
-下文用 $c$ 表示 `context_length`（已在 KV cache 中的上下文），$q$ 表示 `query_length`（本步新算的 token 数）。一条 request 对应平面上一个点 $(c, q)$。
+## 1. 确定样本粒度
 
-## 1. 分箱
+每个样本记为 $(c,q)$：`c` 是已缓存的上下文，`q` 是本次新增输入。
 
-对全部 $N$ 条 request 的 $(c, q)$ 做等距网格：
+- 请求级数据：一条请求一个样本，权重表示请求占比。
+- Chunk 日志：一条 `(forward, request)` 记录一个样本，权重表示 chunk 出现频率。同一请求可能出现多次。
 
-- $c$ 方向每 $8192$ 一格（与 `max_num_batched_tokens` 对齐）
-- $q$ 方向每 $1024$ 一格（与 `block_size × dcp_world_size` 对齐）
+当前 [prefill_grid_alpha.py](../scripts/prefill_grid_alpha.py) 使用第二种粒度。它不能直接产出请求级分布，也没有保留完整 batch 的 `b`。
 
-格子 $(i, j)$ 覆盖
+## 2. 分箱、取代表点、选覆盖率
 
-$$
-c \in [8192\,i,\ 8192\,(i+1)),
-\qquad
-q \in [1024\,j,\ 1024\,(j+1))
-$$
-
-任意 request 恰好落入一格。记 $N_{ij}$ 为落入 $(i, j)$ 的点数，则 $\sum_{i,j} N_{ij} = N$。
-
-## 2. 代表点
-
-空格子丢掉。非空格子用格内点的**取整均值**当测量坐标 $(c_i, q_j)$，避免用格子边角去测一个实际很少出现的形状：
+设两个网格跨度为 $\Delta c,\Delta q$：
 
 $$
-c_i = \mathrm{round}\left(\frac{1}{N_{ij}}\sum_{n=1}^{N_{ij}} c_n\right),
-\qquad
-q_j = \mathrm{round}\left(\frac{1}{N_{ij}}\sum_{n=1}^{N_{ij}} q_n\right)
+i=\lfloor c/\Delta c\rfloor,\qquad j=\lfloor q/\Delta q\rfloor
 $$
 
-$c_n$、$q_n$ 是该格内第 $n$ 个点的 `context_length`、`query_length`。
+K3 示例取 `Δc = 8192`、`Δq = 1024`。这些是采样网格参数，换模型和长度范围后可以调整。
 
-## 3. 按覆盖率选格并赋权
-
-按 $N_{ij}$ **从高到低**选格子，累加点数，直到首次满足
+每个非空格子统计样本数 $N_{ij}$，用格内 `c`、`q` 的取整均值作为代表点。按 $N_{ij}$ 降序选择格子，直到累计覆盖率首次达到 $\alpha$，再在入选集合 $S$ 内归一化：
 
 $$
-\sum_{(i,j)\in S} N_{ij} \ge \alpha N
+\sum_{(i,j)\in S}N_{ij}\ge\alpha N,\qquad
+w_{ij}=\frac{N_{ij}}{\sum_{(u,v)\in S}N_{uv}}
 $$
 
-$S$ 是入选集合，$\alpha$ 是覆盖率阈值（例如 $0.8$）。排在后面的稀有形状不测。
+未选中的长尾要报告占比。若代表点不满足 cache block、checkpoint 或 token budget 约束，应投影到可测坐标，并记录目标值与实际值的偏差。
 
-权重只在入选格子上归一化（入选格子的权重和为 $1$）：
+```bash
+python3 scripts/prefill_grid_alpha.py \
+  -i prefill/prefill_forwards_profiling.csv \
+  -o out/prefill_grid --alpha 0.8 --cbin 8192 --qbin 1024
+```
+
+输出 `out/prefill_grid_allcells.csv` 和 `out/prefill_grid_selected.csv`；这里的覆盖率按 `(forward, request)` 记录数计算。
+
+## 3. 固定并发实测
+
+所有点使用相同的模型、硬件、并行配置和客户端并发 $C$。构造 cached prefix `c` 与 fresh input `q`，设置 `OSL = 1`，并回读引擎记录核对实际形状。具体方法见[Prefill 测点](measure_prefill_performance_point.md)。
+
+完整输入吞吐使用 `c + q` 作 token 口径；fresh 吞吐只数 `q`。前缀命中率和 chat template 会影响实际长度，不能仅依据命令行参数认定测点有效。`concurrency = C` 也不能保证每次 forward 的 `b = C`。
+
+## 4. 汇总
+
+形状加权性能为：
 
 $$
-N_S = \sum_{(i,j)\in S} N_{ij},
-\qquad
-w_{ij} = \frac{N_{ij}}{N_S}
-\quad (i,j)\in S
+\overline T_{\mathrm{shape}}(C)=\sum_{(i,j)\in S}w_{ij}T_{ij}(C)
 $$
 
-## 4. 定点实测，再加权
-
-对每个 $(i,j)\in S$，固定形状 $(c_i, q_j)$ 测得吞吐 $T_{ij}$（tok/s）。理想吞吐取入选格子的加权平均：
-
-$$
-\hat{T} = \sum_{(i,j)\in S} w_{ij}\, T_{ij}
-$$
-
-$w_{ij}$ 是该形状在入选集合里出现的频繁程度，$T_{ij}$ 是这个形状单独能跑到的吞吐。
-
-* 测 $T_{ij}$ 时沿用 `run_aiperf_workload_shape.sh` 的 prefix/fresh 拆分：`--isl = c_i + q_j`，cached prefix 长度 $= c_i$，fresh $= q_j$。把 `--osl` 设为 1（并 `min_tokens=max_tokens=1`），把 decode 压到最短，使 TTFT 和 input tok/s 反映的是 prefill，而不是脚本默认 OSL=1000 那种 decode SLA 测量
-* 测 $T_{ij}$ 时要在aiperf侧指定`concurrency`
+报告时写明它是入选形状的加权均值。若要估计处理完整请求集合的吞吐，应按[工作量 / 时间公式](../docs/metrics.md#4-按请求形状加权时的区别)汇总，并验证混合调度的影响。Chunk 级分布不能直接代入每请求的 P/D 容量配平。

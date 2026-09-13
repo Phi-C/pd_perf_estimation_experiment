@@ -21,10 +21,10 @@ DROP_PREFIX = ("grid_", "final_")   # 重跑时先清掉自己上次写的列
 
 
 def load_exec_seconds(d):
-    """从 Perfetto trace 读每个 forward 的执行时间(秒), starvation step 的 GPU 空转已扣除。
+    """从 Perfetto trace 读每个 forward slice 的估算时长(秒)，已分出估算 idle。
 
     ⚠️ log 只有秒级时间戳, 同一秒里的多个 forward 是均匀平铺的, 所以**单个 forward 的耗时
-       不可信**。但这里是按点聚合(每个点平均 10 个 forward), 平铺误差基本抵消, 点级占比可用。
+       不可信**。按点聚合可用于粗粒度选点，但不能保证平铺误差抵消，也不能替代 GPU 测时。
     """
     for name in ("prefill_forwards_trace_full.json.gz", "prefill_forwards_trace_full.json"):
         p = os.path.join(d, name)
@@ -46,7 +46,7 @@ def main():
     ap.add_argument("--c-bin", type=int, default=8192, help="eq_context_length 的格子跨度")
     ap.add_argument("--q-bin", type=int, default=1024, help="eq_query_length 的格子跨度")
     ap.add_argument("--rank-by", choices=("time", "work", "count"), default="time",
-                    help="待测点优先级依据。time=实测执行时间(默认, 需要先跑 gen_prefill_trace.py); "
+                    help="待测点优先级依据。time=日志估算区间时长(默认, 需要先跑 gen_prefill_trace.py); "
                          "work=Attention 工作量; count=forward 次数")
     ap.add_argument("--no-snap-below", type=int, default=None,
                     help="q_eq 中位数小于该值的格子不吸附, final_q 直接取中位数四舍五入。"
@@ -119,7 +119,7 @@ def main():
         for _, _, b, aw, es in pts:
             k = (fc, fq, b)
             cnt[k] += 1; work[k] += aw; secs[k] += es
-    # 默认按实测时间。attn 工作量当时间的代理并不好 —— 它把大 context 的点抬得过高, 真实耗时里
+    # 默认按日志估算时间。attn 工作量当时间的代理并不好 —— 它把大 context 的点抬得过高, 真实耗时里
     # 有很大一块(KV offload/RDMA 收尾/kernel launch)不随 q·c 走。按次数排则会把 q≈1024 那排的
     # 尾巴 forward 顶到最前面: 次数多但每次都便宜。本例覆盖 80% 时间: time 190 点, count 206,
     # work 268 —— 代理排序反而最差。
@@ -156,7 +156,7 @@ def main():
         print(f"⚠️ final_query_length == 0 的待测点: {len(zero)} 个 —— 无新 token 即无 forward, "
               f"测不了。--no-snap-below 设成 --q-bin(默认)可消除")
     print(f"优先级按 {a.rank_by} 排 (--rank-by)"
-          + (f", forward 执行时间合计 {ts_:.0f}s" if ts_ else ""))
+          + (f", forward slice 估算时长合计 {ts_:.0f}s" if ts_ else ""))
     cn = cw = cs = 0.0; hit = {}
     for i, k in enumerate(order, 1):
         cn += cnt[k]; cw += work[k]; cs += secs[k]
