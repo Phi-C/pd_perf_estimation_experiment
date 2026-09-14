@@ -4,23 +4,17 @@ prefill_forwards.csv (+ gap_events.json / idle_gaps.json) -> Perfetto trace (.js
 
 打开方式: https://ui.perfetto.dev -> Open trace file
 
-时间模型(关键, 别改错)
-----------------------
-CSV 的 `time` 是**调度时刻**, 所以 t[k+1]-t[k] = 第 k 个 engine step 的**完整延迟**
-(forward 计算 + KV offload/RDMA 收尾 + 下一次调度)。引擎这段时间是连续忙的。
-
-  busy step        -> forward slice 铺满 [t_k, t_{k+1}), 不画任何 gap, 利用率 counter 保持
-  starvation step  -> forward slice 只占 D̂ (同 ctx 桶、同样收尾的 busy step 均值),
-                      剩下的才是**真正的 GPU 空转**, 单独画在 idle 轨上, counter 掉到 0
-
-常见错误: 把 forward 画成固定宽度、把剩下的都标成 "gap"。那样一个跑了 3s 的 long-context
-forward 会被画成 "1s forward + 2s 空档", 于是 "长 context 计算" 被错误地归因成空档原因。
-长 context 只会让 slice 变宽, 不会在两次 forward 之间造出洞。
+时间模型
+--------
+CSV 的 `time` 是秒级调度时刻。同秒内的 forward 均匀平铺，区间宽度不是 GPU 测时。
+没有队列耗尽证据时，slice 铺满相邻调度区间；有证据时，用同 context 桶的完成步
+均值估计执行部分，其余画作等待区间。这个划分用于粗粒度分析，不是忙闲时间的实测，
+也不保证所得等待时间为严格下界。Token Budget counter 表示 token 预算使用比例。
 
 Track 布局 (pid=1)
   Counter "Token Budget Util (%)" / "batch_tokens" / "batch_reqs"
-  tid=1     Forward (step 执行)     每 forward 一条, 宽度 = 该 step 执行时长, 颜色 = budget 利用率
-  tid=2     GPU idle (等新请求到达)  只画真正的空转
+  tid=1     Forward (估算区间)     每 forward 一条, 颜色 = budget 利用率
+  tid=2     等待新请求 (估算)      根据队列耗尽证据拆分
   tid=10+j  req slot j              该 forward 内第 j 条 request 的 chunk 明细
 """
 import csv, json, gzip, os, collections, statistics, argparse
@@ -97,7 +91,7 @@ def bucket(c):
     return ">512K"
 
 # D̂: starvation step 自己的执行时长, 用同 ctx 桶、同样"跑完了 request"的 busy step 均值折算。
-# 这是保守估计(这类 step 偏慢), 所以推算出的空转时间是**下界**。
+# 同类 step 的均值是估计值；不保证每一步都偏慢，因此不能据此给出严格下界。
 step_s = {k: t_abs[order[i+1]] - t_abs[k] for i, k in enumerate(order[:-1])}
 base = collections.defaultdict(list)
 for k in step_s:
@@ -110,7 +104,7 @@ events = [{"ph": "M", "pid": 1, "name": "process_name",
 if A.phase_split > 0:
     events += [{"ph":"M","pid":1,"tid":0,"name":"thread_name","args":{"name":"aiperf Phase"}},
                {"ph":"M","pid":1,"tid":0,"name":"thread_sort_index","args":{"sort_index":-1}}]
-for tid, nm, si in [(1, "Forward (step 执行)", 0), (2, "GPU idle (等新请求到达)", 1)]:
+for tid, nm, si in [(1, "Forward (估算区间)", 0), (2, "等待新请求 (估算)", 1)]:
     events += [{"ph":"M","pid":1,"tid":tid,"name":"thread_name","args":{"name":nm}},
                {"ph":"M","pid":1,"tid":tid,"name":"thread_sort_index","args":{"sort_index":si}}]
 for j in range(max(len(g) for g in fwd.values())):
@@ -169,7 +163,7 @@ for n, k in enumerate(order):
                  "imbalance_rq":round(rq,3), "imbalance_rL":round(rL,3),
                  "eq_confidence":("高 (近同构)" if rq <= 1.2 and rL <= 1.2 else
                                   "中" if rq <= 2.5 and rL <= 1.8 else "低 (长度严重不均衡, 需异构样本校正)"),
-                 "slice_width_is_estimated": k in idle,
+                 "slice_width_is_estimated": True,
                  "why_this_long": "; ".join(notes) or "常规 step",
                  "log_evidence": e or "(该 step 窗口内 log 无特征事件)",
                  "req_ids": ",".join(r["req_id"] for r in g),
@@ -191,20 +185,19 @@ for n, k in enumerate(order):
         who = ", ".join(f'req{x["req_id"]}(ISL={x["ISL"]}) 在 {x["arrived_after_s"]}s 后到达'
                         for x in (idle[k].get("next_reqs") or [])) or "?"
         events.append({"ph":"X","pid":1,"tid":2,"ts":ts+d,"dur":span-d,"cname":"white",
-            "name": f"IDLE {(span-d)/SEC:.2f}s · 等新请求 (after F{k})",
+            "name": f"估算等待 {(span-d)/SEC:.2f}s · 等新请求 (after F{k})",
             "args": {"after_forward":k, "idle_seconds_est":round((span-d)/SEC,2),
                      "step_latency_s":span/SEC, "exec_part_estimated_s":round(d/SEC,2),
-                     "cause":"引擎 running 与 waiting 均为空, 没有任何 request 可以调度",
+                     "cause":"根据请求进度与 arrival 推断队列可能耗尽",
                      "next_forward_runs":who,
-                     "why":"客户端并发有限, agentic replay 同一条 lane 要等上一轮 decode 结束才发下一轮, "
-                           "prefill 节点因此周期性空转",
-                     "note":"执行部分按同 ctx 桶、同样收尾的 busy step 均值折算(保守), CSV 时间戳仅秒级分辨率"}})
-        stat["真正空转 (等新请求到达)"][0] += 1
-        stat["真正空转 (等新请求到达)"][1] += (span-d)/SEC
+                     "why":"没有可见的待算请求；具体上游等待原因需用驱动日志确认",
+                     "note":"执行部分按同 ctx 桶的完成步均值估算，时间戳仅秒级精度，不保证严格忙闲边界"}})
+        stat["等待新请求 (估算)"][0] += 1
+        stat["等待新请求 (估算)"][1] += (span-d)/SEC
     if n + 1 < len(order):
-        key = ("step 执行: 首次 JIT" if "JIT" in tags else
-               "step 执行: 收尾 KV offload+RDMA" if "KV→D" in tags else
-               "step 执行: 长 context 计算" if c >= 262144 else "step 执行: 常规 forward")
+        key = ("估算区间: 含首次 JIT 日志" if "JIT" in tags else
+               "估算区间: 含 KV offload/RDMA 日志" if "KV→D" in tags else
+               "估算区间: 长 context" if c >= 262144 else "估算区间: 常规 forward")
         stat[key][0] += 1; stat[key][1] += d/SEC
 
 # ---- aiperf 阶段分界 ----
@@ -218,7 +211,7 @@ if A.phase_split > 0:
         "name": f"▼ {L2} 开始 (aiperf: Credit phase start)",
         "args": {"t_offset_s": A.phase_split,
                  "source": "aiperf log: `Credit phase start: profiling`",
-                 "note": "左侧 warmup 冷缓存, 右侧 profiling 才是被计入 CI 指标的 3600s 窗口"}})
+                 "note": "阶段边界来自命令行参数；客户端完整计量窗口另行核对"}})
     for lbl, a, b, cn in [(L1, 0, SPLIT, "thread_state_iowait"),
                           (L2, SPLIT, END, "thread_state_running")]:
         events.append({"ph":"X","pid":1,"tid":0,"ts":a,"dur":b-a,"cname":cn,
@@ -229,7 +222,7 @@ if A.phase_split > 0:
 doc = {"traceEvents": events, "displayTimeUnit": "ms",
        "otherData": {"label": A.label, "max_num_batched_tokens": str(BUDGET),
                      "forwards": str(len(fwd)), "pairs": str(len(rows)),
-                     "time_model": "t[k+1]-t[k] = engine step 延迟; 只有 starvation step 才有真正空档",
+                     "time_model": "秒级调度区间均摊；依据队列耗尽证据估算等待部分，非 GPU 测时",
                      "profiling_starts_at_s": str(A.phase_split) if A.phase_split > 0 else "(未标注)"}}
 json.dump(doc, open(OUT, "w"))
 if not A.no_gz:

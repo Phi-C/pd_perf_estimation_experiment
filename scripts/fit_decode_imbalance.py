@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""用校准批的结果拟合 §10.3 的异构修正系数。
+"""用成对校准批拟合 Decode 工作量等价法中的异构修正系数。
 
     log(D_real / D_base) = b1 * CV_L^2 + b2 * log r_max        (+ b3 * CV_block^2)
 
 `D_base` 取同一个点的 A_homog（同 L_eq、同 b、CV_L=0、r_max=1），所以每个点自带
 基准，`L` 和 `b` 的主效应被差分掉了 —— 剩下的只有形状。
 
-β3 在本 setup 下不可识别（§6.4：align == page == 1024 ⇒ CV_block ≡ CV_L），
+β3 在本 setup 下不可识别（align == page == 1024 ⇒ CV_block ≡ CV_L），
 默认只拟两项；--with-cvb 强行加第三项只是为了把病态条件数打出来看。
 
 系数不假设为正：Split-K / 分区 / 负载均衡完全可能让某些异构形状更快。
@@ -63,15 +63,15 @@ r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
 cond = float(np.linalg.cond(X))
 mape = float(np.mean(np.abs(np.expm1(pred - y)))) * 100
 
-L = [f"# decode 异构修正系数（§10.3）", "",
+L = ["# Decode 异构修正系数", "",
      f"指标 `{a.metric}`，样本 {len(rows)} 条（B/C/D 形状），基准 = 同点 A_homog。", "",
      "| 项 | 系数 |", "|---|---:|"]
 for c, v in zip(cols, beta):
     L.append(f"| `{c}` | {v:+.5f} |")
-L += ["", f"- R² = **{r2:.4f}**", f"- cond(X) = **{cond:.2f}**（>30 就别信单个系数）",
-      f"- 预测 `D` 的平均相对误差 = **{mape:.2f}%**", "",
+L += ["", f"- 样本内 R² = **{r2:.4f}**", f"- cond(X) = **{cond:.2f}**（较大时检查共线性）",
+      f"- 样本内时间预测的平均相对误差 = **{mape:.2f}%**；未做独立验证", "",
       "定价公式：`D = D_n(L_eq) · exp(" +
-      " + ".join(f"{v:+.5f}·{c.replace('x_cv2','CV_L²').replace('x_logr','log r_max').replace('x_cvb2','CV_block²')}"
+      " ".join(f"{v:+.5f}·{c.replace('x_cv2','CV_L²').replace('x_logr','log r_max').replace('x_cvb2','CV_block²')}"
                  for c, v in zip(cols, beta)) + ")`", "",
       "## 逐样本", "",
       "| tag | b | L_eq | CV_L | r_max | D_base | D | 实测比 | 拟合比 |",

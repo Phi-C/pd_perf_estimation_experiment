@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Select a same-day phase from an already parsed Prefill CSV.
 
-Parse the complete log first so request instance IDs remain stable. The output
-keeps every original column and forward ID; --since is inclusive and --until
+Parse the complete log first so request progress and arrival matching are preserved.
+The output keeps every original column and forward ID; --since is inclusive and --until
 is exclusive. See prefill/SKILL.md for the full workflow.
 """
 import argparse

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""用 aiperf 实测的性能点估 profiling 段的理论吞吐。
+"""用 AIPerf TTFT 差分得到的性能点估 profiling 段吞吐。
+
+target_fwd_gpu_ms 是历史字段名，来自 TTFT 扣除客户端和尾部估计，
+不是 GPU event 直接测时。纯模型路线见 throughput_from_probe.py。
 
 步骤(按需求):
   1. profiling 段每个 forward batch 按 (c, q, b) 去对实测点表; 能对上的留下
-  2. N = 对上的 forward 数, T = Σ 实测单次 GPU 时间
+  2. N = 对上的 forward 数, T = Σ 单次 TTFT 差分估计时间
   3. 吞吐 = Σ_i w_i * tput_i, 权重 w_i = t_i / T
 
   ⚠️ 第 3 步的加权平均在代数上恒等于 Σtokens/T:
@@ -16,10 +19,18 @@
 以及 RESULTS 表里的 (c,q,b) 是同一套等价同构映射后的坐标。
 分子给两种 token 口径: fresh(真过 GPU 的 chunk_tokens) 和 完整 ISL。
 """
-import csv, collections
+import argparse, csv, collections
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parents[1]
+ap = argparse.ArgumentParser(description=__doc__)
+ap.add_argument("--forwards", type=Path, default=BASE / "prefill/prefill_forwards_profiling.csv")
+ap.add_argument("--measured", type=Path, default=BASE / "bench_run/RESULTS_223_points.csv")
+ap.add_argument("--model", type=Path, default=BASE / "bench_run/model_params.json")
+a = ap.parse_args()
 
 MEAS = {}
-for r in csv.DictReader(open("bench_run/RESULTS_223_points.csv")):
+for r in csv.DictReader(open(a.measured)):
     if r["status"] == "measured":
         MEAS[(int(r["c"]), int(r["q"]), int(r["b"]))] = float(r["target_fwd_gpu_ms"])
 
@@ -27,7 +38,7 @@ for r in csv.DictReader(open("bench_run/RESULTS_223_points.csv")):
 # ⚠️ ISL 不能按 (forward,request) 行直接累加: 被 chunk 切开的请求会在它跨的每个
 # forward 里各记一遍完整 ISL, 全段加起来 484M, 而真实 ISL 只有 320.76M(虚高 1.5x)。
 # 正确做法: 每个请求的 ISL 只归到它**最后一个** forward(prefill 完成的那次)。
-rows = list(csv.DictReader(open("prefill_forwards_profiling.csv")))
+rows = list(csv.DictReader(open(a.forwards)))
 last = {}
 for r in rows:
     k = r["req_id"]
@@ -62,7 +73,7 @@ H_isl = sum(f["isl"] for f, _ in hit)
 
 print(f"① 匹配: profiling 段 {tot_f} 个 forward, 对上实测点的 N = {N} ({100*N/tot_f:.1f}%)")
 print(f"   未匹配 {tot_f-N} 个, 按 b 分布: {dict(sorted(miss.items()))}")
-print(f"② T = {T:.1f} s   (这 N 个 forward 的实测 GPU 时间合计)")
+print(f"② T = {T:.1f} s   (这 N 个 forward 的 TTFT 差分估计时间合计)")
 print(f"   分子: fresh {H_fresh/1e6:.2f} M tok / 完整 ISL {H_isl/1e6:.2f} M tok")
 print(f"   覆盖: forward {100*N/tot_f:.1f}%, fresh token {100*H_fresh/tot_fresh:.1f}%, "
       f"ISL {100*H_isl/tot_isl:.1f}%")
@@ -81,11 +92,11 @@ for nm, key in (("fresh", "fresh"), ("ISL", "isl")):
     print(f"   [对照] 按次数加权的平均每-forward {nm:5s} 吞吐 {avg:11,.0f} tok/s"
           f"  ({avg/(sum(f[key] for f,_ in hit)/T):.2f}x 于上面)")
 
-print("\n④ 外推到整个 profiling 段 (假设未匹配部分同吞吐)")
-print(f"   T_all = T / 时间覆盖率 -> ", end="")
+print("\n④ 用 TTFT 差分拟合模型补齐未匹配 forward (非全量实测)")
+print("   T_all = 匹配时间 + 模型补值 -> ", end="")
 # 未匹配的用旧模型补, 得到全段总时间
 import json
-P = json.load(open("bench_run/model_params.json"))
+P = json.load(open(a.model))
 tm = lambda c, b, q: (P["a0"]+P["ar"]*b+P["a1"]*c+P["a2"]*b*c+P["b0"]*b*q+P["b1"]*b*c*q)/1000
 T_all = T + sum(tm(f["c"], f["b"], f["q"]) for f in fwd.values()
                 if (f["c"], f["q"], f["b"]) not in MEAS)

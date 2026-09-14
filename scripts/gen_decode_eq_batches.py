@@ -2,21 +2,21 @@
 """每个 decode forward 的等价同构 batch —— 逐 forward，精确展开。
 
 依据 `ragged_packed_decode_workload_equivalence.md`：
-    L_i   = ISL_i + O_i                       (§2)
-    L_eq  = mean(L_i)  →  等价点 (L_eq, b=n)   (§4.2)
-    ITL ≈ D_n(L_eq),  TPS = n / D_n(L_eq)      (§5, §6)
+    L_i   = ISL_i + O_i
+    L_eq  = mean(L_i)  →  等价点 (L_eq, b=n)
+    TPS   = n / D_n(L_eq)，D 为选定口径的单步时间
 
 与 `decode_steps.csv` 的区别：那里一行是一个 membership **区间**（--max-span 切段，
 用区间中点近似）；这里一行是**一个 forward**。区间内 b 恒定、每个 L_i 每步 +1，
 所以 L_eq 每步精确 +1、std(L_i) 恒定 —— 逐 forward 展开是无损的，不是插值。
 
-同时给出 §11 的两个场景（无异构校准数据时应同时报告）：
+同时保留两个敏感性场景的坐标：
     L_eq  → 工作量等价估计   D_work      = D_n(mean L_i)
     L_max → 最大长度场景     D_max_shape = D_n(max  L_i)
     rho_L = L_max / L_eq，接近 1 时工作量等价更可信。
 
 ⚠️ step 是 scheduler 的 `_schedule_tick`（含 prefill 轮/空转轮），区间内被无差别
-当成 decode 步，所以 forward 行数是上界（对 aiperf +1.85%，见 decode/SKILL.md 坑 2）。
+当成 decode 步；本例重放 token 比 AIPerf 多 1.85%，需和客户端逐次对账。
 """
 import argparse, csv, math, os
 from collections import defaultdict

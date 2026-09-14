@@ -68,7 +68,7 @@ if ok:
     gb = [r["gpu_busy"] for r in ok if r["gpu_busy"]]
     dv = [r["itl_ms"] - r["D_ms"] for r in ok if r["itl_ms"] and r["D_ms"]]
     L += ["", "## 两路口径的差", "",
-          f"- GPU busy `fwd/D`：{min(gb):.3f} .. {max(gb):.3f}（中位 {sorted(gb)[len(gb)//2]:.3f}）",
+          f"- 时间比 `fwd/D`：{min(gb):.3f} .. {max(gb):.3f}（中位 {sorted(gb)[len(gb)//2]:.3f}，非硬件利用率）",
           f"- `ITL − D`：{min(dv):+.2f} .. {max(dv):+.2f} ms（中位 {sorted(dv)[len(dv)//2]:+.2f}）"]
 open(a.out_prefix + ".md", "w").write("\n".join(L) + "\n")
 print(f"{a.out_prefix}.csv / .md: {len(rows)} 行，OK {len(ok)}")

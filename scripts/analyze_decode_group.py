@@ -4,7 +4,7 @@
   引擎侧 (_fwdprobe)  : fwd_gpu_ms（纯模型 forward）、step_wall_ms、step_period_ms
   客户端侧 (aiperf)   : ITL（含调度/网络/流式开销）
 
-两者之差就是 §3 里 D_n(L) 到用户可见 ITL 之间的那层壳。
+两路边界不同，时间差仅作诊断，不能逐项识别调度、网络或采样成本。
 
 验收（§2.3 / §5）：只认 prefill==0 && !dummy && b==目标 && 所有 q==1 的 forward，
 再把 ctx[] 还原出 L_eq / CV_L / r_max 和目标形状对账 —— 混进 prefill chunk 或
@@ -151,7 +151,7 @@ def main():
         fwd_gpu_ms_p50=round(med(fwd), 3), fwd_gpu_ms_mean=round(sum(fwd)/len(fwd), 3) if fwd else None,
         step_wall_ms_p50=round(med(wall), 3),
         step_period_ms_p50=round(D, 3),
-        # §3: D_n(L) 就是 ITL；TPS 是 batch 的 decode token 吞吐，绝不是各请求吞吐之和的平均
+        # D 是引擎返回间隔；稳定窗口中用 b/D 估计整个 batch 的 token 吞吐。
         D_ms=round(D, 3), tps_tok_s=round(a.b / D * 1000.0, 2) if D == D and D > 0 else None,
         overhead_ms=round(D - med(fwd), 3) if fwd else None,
         gpu_busy_frac=round(med(fwd) / D, 4) if fwd and D else None,

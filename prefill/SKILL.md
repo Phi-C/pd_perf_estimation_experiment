@@ -17,18 +17,20 @@ python3 scripts/parse_prefill_log.py "$PREFILL_LOG" \
 
 输出 `prefill_forwards.csv`、`gap_events.json`、`idle_gaps.json` 和 `prefill_stat.md`。
 
-**CSV 一行是一个 `(forward, request)` 对**。按 forward 统计时先用 `forward_idx` 去重；统计请求总 ISL 时按解析后的请求实例去重。
+**CSV 一行是一个 `(forward, request)` 对**。按 forward 统计时先用 `forward_idx` 去重；统计请求总 ISL 时每条请求只计一次。
 
 | 字段 | 用途 |
 |---|---|
 | `forward_idx, time` | forward 编号、引擎秒级时间 |
-| `req_id, ISL` | 请求实例、完整输入长度 |
+| `req_id, ISL` | 日志中的原始请求 ID、完整输入长度 |
 | `done_tokens, chunk_tokens` | 本步的 c、q |
 | `batch_reqs, batch_tokens` | 整个 batch 的规模，同一 forward 的多行重复 |
 | `eq_batch_size, eq_query_length, eq_context_length` | 工作量映射后的同构坐标 |
 | `attn_work_pairs, imbalance_rq, imbalance_rL` | 工作量及不均衡特征 |
 
 解析器处理日志重放、原始 request ID 复用和 arrival 匹配。换引擎版本时，检查文件顶部的 `RE_SCHED`、`RE_ARR`，并核对解析器输出的去重数与匹配数。
+
+请求实例只在解析器内部区分，CSV 尚未导出独立实例 ID。当前吞吐脚本按 `req_id` 去重，因此必须核对窗口内的 ID 复用及进度回退；同一 ID 对应相同 ISL 也不能证明没有重放。跨阶段或跨次运行的数据应先拆分，不能直接按原始 ID 合并 ISL。
 
 ## 2. 选择 profiling 段
 
@@ -61,6 +63,8 @@ python3 scripts/gen_final_points.py -d out/prefill/profiling \
 `1374.97` 是示例中 profiling marker 相对首个引擎 forward 的秒数。Perfetto 文件可在 [ui.perfetto.dev](https://ui.perfetto.dev) 打开。只按次数选点时，可直接用 `--rank-by count`，不依赖 trace。
 
 选点脚本对每个 `(c, q)` 格子取中位数、吸附到最近网格角点，再按 `(final_c, final_q, b)` 去重。默认不吸附 `q < q-bin` 的格子，避免把短尾 chunk 拉大或吸到 0。
+
+这里按 profiling 分布为新实验选点。K3 保存的旧测量坐标来自完整日志分桶后再筛 profiling，顺序不同会改变坐标；复现旧结果时使用 [K3 说明](../experiments/exp1_kimi_k3/Reproduce.md#3-重新提取形状)中的顺序。
 
 | 输出 | 含义 |
 |---|---|

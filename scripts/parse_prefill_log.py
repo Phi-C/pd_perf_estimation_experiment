@@ -6,15 +6,14 @@ ATOM prefill node CI log  ->  prefill_forwards.csv + gap_events.json + idle_gaps
     gh api repos/ROCm/ATOM/actions/jobs/<JOB_ID>/logs > job.log
     python3 parse_prefill_log.py job.log -o <outdir> [--label "kimi-k3 c32"]
 
-只读一遍 log。所有正则都是"匹配不到就产出 0", 换用例不会崩。
+按当前 ATOM 日志格式解析；换引擎版本需核对匹配数和请求进度。
 
 时间模型
 --------
 引擎自己打的 `[atom HH:MM:SS]` 是**调度时刻**(秒级)。GitHub runner 行首的
 `2026-08-29T12:21:02.6193014Z` 是**日志转发时刻**, 比引擎晚 12~30s 且批量刷新, 不能当时间用,
-只能用来定顺序。因此:
-    t[k+1] - t[k]  ==  第 k 个 engine step 的完整延迟 (forward 计算 + KV 收尾 + 下一次调度)
-两次 forward 之间**没有**天然空洞; 只有引擎 running+waiting 全空、无请求可调度时才是真空转。
+只能辅助定位。相邻调度时间的间隔包含执行、收尾和等待，不能当作 GPU 测时。
+idle_gaps.json 根据请求进度及 arrival 寻找队列耗尽的证据；空闲时长仍需估算。
 """
 import re, sys, csv, json, gzip, os, argparse, collections, statistics
 
@@ -252,7 +251,7 @@ L += ["", f"- forward: **{len(forwards)}**, (forward,request) pairs: **{pairs}**
       f"- 打满 budget 的 forward: {full} ({full*100.0/len(forwards):.1f}%)",
       f"- LMCache 前缀命中的请求: {sum(1 for i in insts if i['prefix_hit'])} "
       f"(命中 tokens 合计 {sum(i['prefix_hit'] for i in insts):,})",
-      f"- 空转 step: {len(idle)}, 空转 step 总延迟 {idle_s}s ({idle_s*100.0/max(span,1):.1f}% 的墙钟)",
+      f"- 疑似队列耗尽的 step: {len(idle)}，这些调度区间共 {idle_s}s ({idle_s*100.0/max(span,1):.1f}% 的墙钟)，含执行时间，非 GPU 空闲测时",
       "", "## batch_reqs 分布", "", "| batch_reqs | forward 数 | 占比 |", "|---:|---:|---:|"]
 for n in sorted(br): L.append(f"| {n} | {br[n]} | {br[n]*100.0/len(forwards):.2f}% |")
 

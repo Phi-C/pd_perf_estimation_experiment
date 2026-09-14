@@ -9,6 +9,7 @@
 | 区分客户端吞吐、引擎步长和纯模型时间 | [指标与统计口径](docs/metrics.md) |
 | 了解 Kimi-K3 的结果、覆盖率和限制 | [K3 实验结论](experiments/exp1_kimi_k3/Summary.md) |
 | 用现有数据复算 K3 结果 | [K3 复现说明](experiments/exp1_kimi_k3/Reproduce.md) |
+| 查看 α=0.8 形状统计实验与测量进度 | [统计实验报告](experiments/exp1_kimi_k3/stat_alpha0.8/Report.md) |
 | 从日志提取 Prefill 形状并选点 | [Prefill 操作流程](prefill/SKILL.md) |
 | 从 StepMembers 重放 Decode batch 并选点 | [Decode 操作流程](decode/SKILL.md) |
 | 查找脚本、输入输出和依赖 | [脚本索引](scripts/README.md) |
@@ -35,6 +36,8 @@ flowchart LR
 ```
 
 若每步已有可靠的 GPU 测时，可直接使用；缺少测时时才需要等价映射和性能表。推导见 [Prefill 工作量等价法](prefill/ragged_packed_prefill_workload_equivalence.md) 与 [Decode 工作量等价法](decode/ragged_packed_decode_workload_equivalence.md)。
+
+K3 的 Prefill 形状来自原 CI，完整 Decode 形状来自本地重跑；历史 Prefill GPU 点表目前缺失，统计实验的 Decode 实测仍未覆盖全部代表点。可复算范围和部分结果的快照时间见上述实验文档。
 
 ## 如何测量
 
